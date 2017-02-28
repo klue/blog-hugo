@@ -1,3 +1,23 @@
 languageCode = "en-us"
-title = "My New Hugo Site"
-baseurl = "http://example.org/"
+title = "klue-less thoughts"
+baseurl = "https://klue.github.io/"
+theme = "beautifulhugo"
+
+[permalinks]
+post = "/blog/:year/:month/:filename/"
+
+[author]
+name = "klue"
+description = "Just my thoughts, mostly about computer science."
+linkedin = "kedyliu"
+twitter = "kedyliu"
+github = "klue"
+
+[params]
+googleAnalytics = "UA-92808803-1"
+disqusShortname = "klueless"
+
+[[menu.main]]
+name = "about"
+url = "/about/"
+
