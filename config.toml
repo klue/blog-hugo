@@ -3,6 +3,8 @@ title = "klue-less thoughts"
 baseurl = "https://klue.github.io/"
 theme = "beautifulhugo"
 
+pygmentsstyle = "xcode"
+
 [permalinks]
 post = "/blog/:year/:month/:filename/"
 
