@@ -18,6 +18,8 @@ github = "klue"
 [params]
 googleAnalytics = "UA-92808803-1"
 disqusShortname = "klueless"
+comments = true
+
 
 [taxonomies]
 tag = "tags"
