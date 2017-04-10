@@ -19,6 +19,7 @@ github = "klue"
 googleAnalytics = "UA-92808803-1"
 disqusShortname = "klueless"
 comments = true
+rss = true
 
 
 [taxonomies]
