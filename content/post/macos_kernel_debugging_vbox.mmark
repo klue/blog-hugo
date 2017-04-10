@@ -109,7 +109,7 @@ $ VBoxManage setextradata 9ad936f8-9360-44a6-ba3e-c4d92b4243e8 VBoxInternal2/Efi
 ```
 
 ## Swapping Kernels
-I eluded to debugging different builds of kernels previously, mentioning that
+I alluded to debugging different builds of kernels previously, mentioning that
 the `kcsuffix` option specifies which kernel build to use. The kernel file must
 be at `/System/Library/Kernels` on the debugee VM. It should not be a surprise
 that this directory is [protected by System Integrity Protection
