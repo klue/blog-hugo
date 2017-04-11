@@ -5,6 +5,7 @@ tags = ["kernel debugging", "macOS", "VirtualBox"]
 categories = ["security"]
 
 +++
+*Update:* In the [HN discussion](https://news.ycombinator.com/item?id=14079163), awalton mentioned you can set CPUID flags in VMWare. Simply adding `cpuid.7.ebx = "-----------0--------------------"` to the vmx file will disable SMAP.
 
 Late last year, I upgraded my old MBP to the 2016 model with a Skylake
 processor. As I was debugging a kernel exploit, it turned out that
@@ -221,5 +222,3 @@ Process 1 stopped
 (lldb)  
 ```
 Voila, source-level debugging macOS kernel!
-
-Link to HN discussion: https://news.ycombinator.com/item?id=14079163
